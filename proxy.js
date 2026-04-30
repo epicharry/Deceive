@@ -19,13 +19,12 @@ class DeceiveProxy {
     this.enabled = true;
     this.status = options.status || 'offline';
     this.connections = [];
+    this.activeConnections = [];
     this.chatServer = null;
     this.configServer = null;
     this.resolvedChatHost = null;
     this.resolvedChatPort = null;
-    // PFX certificate buffer (downloaded from mln.cx/deceive/localhost.pfx)
     this.pfxBuffer = options.pfxBuffer || null;
-    // Alternatively, PEM cert+key
     this.tlsCert = options.tlsCert || null;
     this.tlsKey = options.tlsKey || null;
   }
@@ -48,17 +47,49 @@ class DeceiveProxy {
       conn.destroy();
     }
     this.connections = [];
+    this.activeConnections = [];
     console.log('[Deceive] Proxy stopped');
   }
 
   setStatus(status) {
+    const oldStatus = this.status;
     this.status = status;
     console.log(`[Deceive] Status changed to: ${status}`);
+    // Resend last presence with new status for each active connection
+    for (const conn of this.activeConnections) {
+      if (conn.lastPresence) {
+        const rewritten = this._rewritePresence(conn.lastPresence, status);
+        if (rewritten) {
+          conn.riotSocket.write(rewritten);
+          console.log('[ChatProxy] Resent presence with new status');
+        }
+      }
+    }
   }
 
   setEnabled(enabled) {
     this.enabled = enabled;
     console.log(`[Deceive] Enabled: ${enabled}`);
+    if (!enabled) {
+      // Resend original presence unmodified
+      for (const conn of this.activeConnections) {
+        if (conn.lastPresence) {
+          conn.riotSocket.write(conn.lastPresence);
+          console.log('[ChatProxy] Resent original presence (disabled)');
+        }
+      }
+    } else {
+      // Re-apply filtering
+      for (const conn of this.activeConnections) {
+        if (conn.lastPresence) {
+          const rewritten = this._rewritePresence(conn.lastPresence, this.status);
+          if (rewritten) {
+            conn.riotSocket.write(rewritten);
+            console.log('[ChatProxy] Resent filtered presence (enabled)');
+          }
+        }
+      }
+    }
   }
 
   // --- Config Proxy (HTTP) ---
@@ -106,7 +137,6 @@ class DeceiveProxy {
         return;
       }
 
-      // Resolve player affinity to find the correct chat host
       if (config['chat.affinities'] && config['chat.affinity.enabled']) {
         try {
           const affinityHost = await this._resolveAffinity(
@@ -121,7 +151,6 @@ class DeceiveProxy {
         }
       }
 
-      // Save original chat server details
       if (config['chat.host']) {
         if (!this.resolvedChatHost) {
           this.resolvedChatHost = config['chat.host'];
@@ -133,14 +162,12 @@ class DeceiveProxy {
         config['chat.port'] = this.chatProxyPort;
       }
 
-      // Rewrite all affinities to localhost
       if (config['chat.affinities']) {
         for (const key of Object.keys(config['chat.affinities'])) {
           config['chat.affinities'][key] = '127.0.0.1';
         }
       }
 
-      // Update internal chat target
       if (this.resolvedChatHost) {
         this.chatHost = this.resolvedChatHost;
       }
@@ -177,7 +204,6 @@ class DeceiveProxy {
     if (parts.length < 2) return null;
 
     let payload = parts[1];
-    // Fix base64 padding
     while (payload.length % 4 !== 0) {
       payload += '=';
     }
@@ -225,10 +251,8 @@ class DeceiveProxy {
       let tlsOptions = null;
 
       if (this.pfxBuffer) {
-        // PFX certificate (what Deceive uses - downloaded from mln.cx)
         tlsOptions = { pfx: this.pfxBuffer, passphrase: '' };
       } else if (this.tlsCert && this.tlsKey) {
-        // PEM cert+key pair
         tlsOptions = { cert: this.tlsCert, key: this.tlsKey };
       }
 
@@ -237,7 +261,6 @@ class DeceiveProxy {
           this._handleClientConnection(clientSocket)
         );
       } else {
-        // Without TLS certs, use raw TCP (for development/testing only)
         this.chatServer = net.createServer((clientSocket) =>
           this._handleClientConnection(clientSocket)
         );
@@ -279,35 +302,48 @@ class DeceiveProxy {
   }
 
   _proxyConnection(clientSocket, riotSocket) {
-    let clientBuffer = '';
-    let serverBuffer = '';
+    const connState = {
+      clientBuffer: '',
+      serverBuffer: '',
+      lastPresence: null,
+      riotSocket,
+      clientSocket,
+    };
+
+    this.activeConnections.push(connState);
 
     // Client -> Riot (filter presence)
     clientSocket.on('data', (data) => {
-      clientBuffer += data.toString('utf-8');
-      clientBuffer = this._processOutgoing(clientBuffer, riotSocket);
+      connState.clientBuffer += data.toString('utf-8');
+      connState.clientBuffer = this._processOutgoing(connState.clientBuffer, riotSocket, connState);
     });
 
-    // Riot -> Client (pass through)
+    // Riot -> Client (pass through entirely)
     riotSocket.on('data', (data) => {
-      serverBuffer += data.toString('utf-8');
-      serverBuffer = this._processIncoming(serverBuffer, clientSocket);
+      clientSocket.write(data);
     });
+
+    const cleanup = () => {
+      const idx = this.activeConnections.indexOf(connState);
+      if (idx !== -1) this.activeConnections.splice(idx, 1);
+    };
 
     clientSocket.on('close', () => {
       console.log('[ChatProxy] Client disconnected');
       riotSocket.destroy();
+      cleanup();
     });
 
     riotSocket.on('close', () => {
       console.log('[ChatProxy] Riot server disconnected');
       clientSocket.destroy();
+      cleanup();
     });
   }
 
   // Process outgoing data (client -> Riot) with presence filtering
-  _processOutgoing(buffer, riotSocket) {
-    // Handle XMPP stream opening (not a complete XML element)
+  _processOutgoing(buffer, riotSocket, connState) {
+    // Handle XMPP stream opening
     const streamOpenMatch = buffer.match(/^(<\?xml[^?]*\?>)?\s*(<stream:stream[^>]*>)/);
     if (streamOpenMatch) {
       const streamOpen = streamOpenMatch[0];
@@ -322,38 +358,26 @@ class DeceiveProxy {
 
       buffer = buffer.slice(stanza.length);
 
-      if (this.enabled && this._isPresenceStanza(stanza)) {
-        const filtered = this._filterPresence(stanza);
-        if (filtered) {
-          riotSocket.write(filtered);
-          console.log('[ChatProxy] Presence rewritten');
+      if (stanza.trimStart().startsWith('<presence')) {
+        // Store original presence for resend on status change
+        if (!/<presence[^>]+\bto\s*=/.test(stanza)) {
+          connState.lastPresence = stanza;
+        }
+
+        if (this.enabled) {
+          const rewritten = this._rewritePresence(stanza, this.status);
+          if (rewritten) {
+            riotSocket.write(rewritten);
+            console.log('[ChatProxy] Presence rewritten');
+          } else {
+            console.log('[ChatProxy] Presence blocked');
+          }
         } else {
-          console.log('[ChatProxy] Presence blocked');
+          riotSocket.write(stanza);
         }
       } else {
         riotSocket.write(stanza);
       }
-    }
-
-    return buffer;
-  }
-
-  // Process incoming data (Riot -> client) - pass through
-  _processIncoming(buffer, clientSocket) {
-    // Handle stream opening
-    const streamOpenMatch = buffer.match(/^(<\?xml[^?]*\?>)?\s*(<stream:stream[^>]*>)/);
-    if (streamOpenMatch) {
-      const streamOpen = streamOpenMatch[0];
-      clientSocket.write(streamOpen);
-      buffer = buffer.slice(streamOpen.length);
-    }
-
-    // Forward complete stanzas
-    while (true) {
-      const stanza = this._extractStanza(buffer);
-      if (!stanza) break;
-      buffer = buffer.slice(stanza.length);
-      clientSocket.write(stanza);
     }
 
     return buffer;
@@ -364,97 +388,167 @@ class DeceiveProxy {
     const trimmed = buffer.trimStart();
     if (!trimmed || !trimmed.startsWith('<')) return null;
 
-    // Handle self-closing stanzas and stream:stream
-    // Handle </stream:stream> closing tag
-    const closeStreamMatch = trimmed.match(/^<\/stream:stream>/);
-    if (closeStreamMatch) return closeStreamMatch[0];
+    // Handle </stream:stream>
+    if (trimmed.startsWith('</stream:stream>')) return '</stream:stream>';
 
     // Get the tag name
     const tagMatch = trimmed.match(/^<([a-zA-Z_][\w:.-]*)/);
     if (!tagMatch) return null;
     const tagName = tagMatch[1];
 
-    // Self-closing tag
-    const selfCloseRegex = new RegExp(`^<${tagName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^>]*/>`);
-    const selfCloseMatch = trimmed.match(selfCloseRegex);
-    if (selfCloseMatch) return selfCloseMatch[0];
+    // Check for self-closing: find the first > and see if it's preceded by /
+    const firstClose = trimmed.indexOf('>');
+    if (firstClose === -1) return null;
+    if (trimmed[firstClose - 1] === '/') {
+      return trimmed.slice(0, firstClose + 1);
+    }
 
-    // Find matching closing tag, handling nesting
+    // Find matching closing tag, handling nesting and CDATA/comments
     const closingTag = `</${tagName}>`;
     let depth = 0;
     let i = 0;
+    let inTag = false;
 
     while (i < trimmed.length) {
       if (trimmed[i] === '<') {
+        // Check for closing tag of our root element
         if (trimmed.startsWith(closingTag, i)) {
           if (depth === 1) {
             return trimmed.slice(0, i + closingTag.length);
           }
           depth--;
           i += closingTag.length;
-        } else if (trimmed.startsWith(`<${tagName}`, i)) {
-          // Check if it's actually this tag (not a prefix match like <presenceX)
-          const nextChar = trimmed[i + tagName.length + 1];
-          if (nextChar === ' ' || nextChar === '>' || nextChar === '/') {
-            // Check for self-closing
-            const restSlice = trimmed.slice(i);
-            const selfClose = restSlice.indexOf('/>');
-            const openClose = restSlice.indexOf('>');
-            if (selfClose !== -1 && selfClose < openClose) {
-              i += selfClose + 2;
-            } else {
-              depth++;
-              i++;
-            }
-          } else {
-            i++;
-          }
-        } else {
-          i++;
+          continue;
         }
+
+        // Check for opening tag of same name
+        if (trimmed.startsWith(`<${tagName}`, i)) {
+          const afterTag = i + 1 + tagName.length;
+          if (afterTag < trimmed.length) {
+            const ch = trimmed[afterTag];
+            if (ch === ' ' || ch === '>' || ch === '/' || ch === '\n' || ch === '\r' || ch === '\t') {
+              // Find end of this opening tag to check self-closing
+              const tagEnd = trimmed.indexOf('>', i);
+              if (tagEnd === -1) return null;
+              if (trimmed[tagEnd - 1] === '/') {
+                i = tagEnd + 1;
+                continue;
+              }
+              depth++;
+              i = tagEnd + 1;
+              continue;
+            }
+          }
+        }
+
+        i++;
       } else {
         i++;
       }
     }
 
-    // Incomplete stanza, need more data
     return null;
   }
 
-  _isPresenceStanza(stanza) {
-    return stanza.trimStart().startsWith('<presence');
-  }
-
-  // Filter/rewrite presence stanza to appear offline
-  _filterPresence(stanza) {
-    if (this.status === 'chat') {
-      // If status is "chat" (online), pass presence through unmodified
-      return stanza;
+  // Rewrite presence stanza - mirrors Deceive's PossiblyRewriteAndResendPresenceAsync
+  _rewritePresence(stanza, targetStatus) {
+    // If online ("chat"), pass through with minimal changes
+    if (targetStatus === 'chat') {
+      // Deceive in "chat" mode still rewrites <show> to "chat" and game st to "chat"
+      // but only if the original st was NOT "dnd" (do not disturb)
+      let modified = stanza;
+      const lolSt = this._getElementContent(modified, 'league_of_legends', 'st');
+      if (lolSt !== 'dnd') {
+        modified = this._replaceElement(modified, 'show', 'chat');
+        modified = this._replaceGameSt(modified, 'league_of_legends', 'chat');
+      }
+      return modified;
     }
 
-    // If presence has a "to" attribute, it's directed (e.g., MUC) - block it for offline
-    if (/^<presence[^>]+\bto\s*=/.test(stanza)) {
+    // Directed presence (has "to" attribute) - block it to prevent appearing in lobbies
+    if (/<presence[^>]+\bto\s*=/.test(stanza)) {
       return null;
     }
 
-    // Rewrite show element
-    let modified = stanza.replace(
-      /<show>[^<]*<\/show>/,
-      `<show>${this.status}</show>`
-    );
+    let modified = stanza;
 
-    // Remove status message
-    modified = modified.replace(/<status>[^<]*<\/status>/, '');
+    // Rewrite <show> to target status
+    modified = this._replaceElement(modified, 'show', targetStatus);
 
-    // Remove game-specific presence elements to appear fully offline
-    if (this.status === 'offline') {
-      modified = modified.replace(/<games>[\s\S]*?<\/games>/, '<games></games>');
-    } else if (this.status === 'mobile') {
-      // For mobile, remove game data but keep the games container
-      modified = modified.replace(/<games>[\s\S]*?<\/games>/, '<games></games>');
+    // Rewrite league_of_legends <st> to target status
+    modified = this._replaceGameSt(modified, 'league_of_legends', targetStatus);
+
+    // Remove <status> element (the text status message)
+    modified = modified.replace(/<status>[\s\S]*?<\/status>/g, '');
+
+    if (targetStatus === 'mobile') {
+      // For mobile: remove league_of_legends <p> and <m> elements
+      modified = this._removeGameElement(modified, 'league_of_legends', 'p');
+      modified = this._removeGameElement(modified, 'league_of_legends', 'm');
+    } else {
+      // For offline: remove entire league_of_legends element
+      modified = this._removeGameBlock(modified, 'league_of_legends');
     }
 
+    // Always remove these game presences
+    modified = this._removeGameBlock(modified, 'valorant');
+    modified = this._removeGameBlock(modified, 'keystone');
+    modified = this._removeGameBlock(modified, 'riot_client');
+    modified = this._removeGameBlock(modified, 'bacon');
+    modified = this._removeGameBlock(modified, 'lion');
+
     return modified;
+  }
+
+  // Get content of a child element within a game element
+  _getElementContent(xml, gameName, elementName) {
+    const gameRegex = new RegExp(`<${gameName}>[\\s\\S]*?<\\/${gameName}>`);
+    const gameMatch = xml.match(gameRegex);
+    if (!gameMatch) return null;
+
+    const elRegex = new RegExp(`<${elementName}>([^<]*)<\\/${elementName}>`);
+    const elMatch = gameMatch[0].match(elRegex);
+    return elMatch ? elMatch[1] : null;
+  }
+
+  // Replace content of a top-level element like <show>
+  _replaceElement(xml, elementName, value) {
+    const regex = new RegExp(`<${elementName}>[^<]*<\\/${elementName}>`);
+    if (regex.test(xml)) {
+      return xml.replace(regex, `<${elementName}>${value}</${elementName}>`);
+    }
+    return xml;
+  }
+
+  // Replace <st> within a specific game element
+  _replaceGameSt(xml, gameName, value) {
+    const gameRegex = new RegExp(`(<${gameName}>)([\\s\\S]*?)(<\\/${gameName}>)`);
+    return xml.replace(gameRegex, (match, open, content, close) => {
+      const newContent = content.replace(/<st>[^<]*<\/st>/, `<st>${value}</st>`);
+      return open + newContent + close;
+    });
+  }
+
+  // Remove a child element within a game element
+  _removeGameElement(xml, gameName, elementName) {
+    const gameRegex = new RegExp(`(<${gameName}>)([\\s\\S]*?)(<\\/${gameName}>)`);
+    return xml.replace(gameRegex, (match, open, content, close) => {
+      const cleaned = content.replace(
+        new RegExp(`<${elementName}>[\\s\\S]*?<\\/${elementName}>`), ''
+      );
+      return open + cleaned + close;
+    });
+  }
+
+  // Remove an entire game block from within <games>
+  _removeGameBlock(xml, gameName) {
+    // Handle self-closing: <gameName/>
+    xml = xml.replace(new RegExp(`<${gameName}\\s*\\/>`), '');
+    // Handle full element: <gameName>...</gameName>
+    xml = xml.replace(new RegExp(`<${gameName}>[\\s\\S]*?<\\/${gameName}>`), '');
+    // Handle with attributes: <gameName attr="val">...</gameName>
+    xml = xml.replace(new RegExp(`<${gameName}\\s[^>]*>[\\s\\S]*?<\\/${gameName}>`), '');
+    return xml;
   }
 }
 
