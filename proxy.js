@@ -60,7 +60,8 @@ class DeceiveProxy {
         const rewritten = this._rewritePresence(conn.lastPresence, status);
         if (rewritten) {
           conn.riotSocket.write(rewritten);
-          console.log('[ChatProxy] Resent presence with new status:', status);
+          console.log(`[ChatProxy] Resent presence with new status: ${status}`);
+          console.log(`[ChatProxy] Sent XML: ${rewritten.substring(0, 500)}`);
         }
       }
     }
@@ -534,10 +535,17 @@ class DeceiveProxy {
   }
 
   _replaceTopElement(xml, name, value) {
-    return xml.replace(
-      new RegExp(`<${name}>[^<]*<\\/${name}>`),
-      `<${name}>${value}</${name}>`
-    );
+    const re = new RegExp(`<${name}>[^<]*<\\/${name}>`);
+    if (re.test(xml)) {
+      return xml.replace(re, `<${name}>${value}</${name}>`);
+    }
+    // Handle self-closing variant: <name/>
+    const selfClose = new RegExp(`<${name}\\s*\\/>`);
+    if (selfClose.test(xml)) {
+      return xml.replace(selfClose, `<${name}>${value}</${name}>`);
+    }
+    // Element doesn't exist - insert before </presence>
+    return xml.replace('</presence>', `<${name}>${value}</${name}></presence>`);
   }
 
   _replaceNestedElement(xml, parent, child, value) {
@@ -560,9 +568,12 @@ class DeceiveProxy {
   }
 
   _removeBlock(xml, name) {
+    // Self-closing: <name/>  or <name />
     xml = xml.replace(new RegExp(`<${name}\\s*\\/>`), '');
-    xml = xml.replace(new RegExp(`<${name}>[\\s\\S]*?<\\/${name}>`), '');
+    // With attributes: <name attr="x">...</name>
     xml = xml.replace(new RegExp(`<${name}\\s[^>]*>[\\s\\S]*?<\\/${name}>`), '');
+    // Without attributes: <name>...</name>
+    xml = xml.replace(new RegExp(`<${name}>[\\s\\S]*?<\\/${name}>`), '');
     return xml;
   }
 }
