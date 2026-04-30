@@ -6,6 +6,7 @@ const { URL } = require('url');
 
 const CONFIG_URL = 'https://clientconfig.rpg.riotgames.com';
 const GEO_PAS_URL = 'https://riot-geo.pas.si.riotgames.com/pas/v1/service/chat';
+const LOCALHOST_DOMAIN = 'deceive-localhost.molenzwiebel.xyz';
 
 const DEFAULT_CHAT_HOST = 'ap.chat.si.riotgames.com';
 const DEFAULT_CHAT_PORT = 5223;
@@ -147,7 +148,7 @@ class DeceiveProxy {
         if (!this.resolvedChatHost) {
           this.resolvedChatHost = config['chat.host'];
         }
-        config['chat.host'] = '127.0.0.1';
+        config['chat.host'] = LOCALHOST_DOMAIN;
       }
       if (config['chat.port']) {
         this.resolvedChatPort = config['chat.port'];
@@ -156,7 +157,7 @@ class DeceiveProxy {
 
       if (config['chat.affinities']) {
         for (const key of Object.keys(config['chat.affinities'])) {
-          config['chat.affinities'][key] = '127.0.0.1';
+          config['chat.affinities'][key] = LOCALHOST_DOMAIN;
         }
       }
 
