@@ -14,7 +14,7 @@ class DeceiveProxy {
   constructor(options = {}) {
     this.chatHost = options.chatHost || DEFAULT_CHAT_HOST;
     this.chatPort = options.chatPort || DEFAULT_CHAT_PORT;
-    this.chatProxyPort = options.chatProxyPort || 5223;
+    this.chatProxyPort = options.chatProxyPort || 0;
     this.configProxyPort = options.configProxyPort || 0;
     this.enabled = true;
     this.status = options.status || 'offline';
@@ -23,15 +23,18 @@ class DeceiveProxy {
     this.configServer = null;
     this.resolvedChatHost = null;
     this.resolvedChatPort = null;
+    // PFX certificate buffer (downloaded from mln.cx/deceive/localhost.pfx)
+    this.pfxBuffer = options.pfxBuffer || null;
+    // Alternatively, PEM cert+key
     this.tlsCert = options.tlsCert || null;
     this.tlsKey = options.tlsKey || null;
   }
 
   async start() {
-    await this._startConfigProxy();
     await this._startChatProxy();
-    console.log(`[Deceive] Config proxy on port ${this.configProxyPort}`);
+    await this._startConfigProxy();
     console.log(`[Deceive] Chat proxy on port ${this.chatProxyPort}`);
+    console.log(`[Deceive] Config proxy on port ${this.configProxyPort}`);
     return {
       configPort: this.configProxyPort,
       chatPort: this.chatProxyPort,
@@ -219,13 +222,22 @@ class DeceiveProxy {
   // --- Chat Proxy (TLS MITM) ---
   _startChatProxy() {
     return new Promise((resolve) => {
-      if (this.tlsCert && this.tlsKey) {
-        this.chatServer = tls.createServer(
-          { cert: this.tlsCert, key: this.tlsKey },
-          (clientSocket) => this._handleClientConnection(clientSocket)
+      let tlsOptions = null;
+
+      if (this.pfxBuffer) {
+        // PFX certificate (what Deceive uses - downloaded from mln.cx)
+        tlsOptions = { pfx: this.pfxBuffer, passphrase: '' };
+      } else if (this.tlsCert && this.tlsKey) {
+        // PEM cert+key pair
+        tlsOptions = { cert: this.tlsCert, key: this.tlsKey };
+      }
+
+      if (tlsOptions) {
+        this.chatServer = tls.createServer(tlsOptions, (clientSocket) =>
+          this._handleClientConnection(clientSocket)
         );
       } else {
-        // Without TLS certs, use raw TCP (for testing or if cert is handled externally)
+        // Without TLS certs, use raw TCP (for development/testing only)
         this.chatServer = net.createServer((clientSocket) =>
           this._handleClientConnection(clientSocket)
         );
