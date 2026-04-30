@@ -1,0 +1,12 @@
+{
+  "name": "deceive-electron",
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "echo 'No build step required - plain Node.js/Electron app'"
+  },
+  "dependencies": {
+    "electron": "^28.0.0"
+  }
+}
