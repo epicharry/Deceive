@@ -1,4 +1,4 @@
-﻿namespace Deceive;
+namespace Deceive;
 
 /// <summary>
 ///     Which game to automatically launch when Deceive is started.

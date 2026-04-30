@@ -1,4 +1,4 @@
-﻿namespace Deceive
+namespace Deceive
 {
     internal partial class GamePromptForm
     {
