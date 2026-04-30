@@ -490,9 +490,10 @@ class DeceiveProxy {
       return modified;
     }
 
-    // Directed presence (has "to" attribute) - block it
+    // Directed presence (has "to" attribute) - pass through unmodified
+    // These are used for joining MUC rooms (lobbies, agent select, match chat)
     if (/<presence[^>]+\bto\s*=/.test(stanza)) {
-      return null;
+      return stanza;
     }
 
     let modified = stanza;
